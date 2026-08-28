@@ -11,17 +11,18 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"forgejo.org/models/avatars"
 	repo_model "forgejo.org/models/repo"
 	user_model "forgejo.org/models/user"
+	mc "forgejo.org/modules/cache"
 	"forgejo.org/modules/git"
 	"forgejo.org/modules/gitrepo"
 	"forgejo.org/modules/graceful"
 	"forgejo.org/modules/json"
 	"forgejo.org/modules/log"
+	"forgejo.org/modules/process"
 	"forgejo.org/modules/setting"
 	api "forgejo.org/modules/structs"
 
@@ -31,9 +32,8 @@ import (
 const contributorStatsCacheKey = "GetContributorStats/%s/%s"
 
 var (
-	ErrAwaitGeneration  = errors.New("generation took longer than ")
-	awaitGenerationTime = time.Second * 5
-	generateLock        = sync.Map{}
+	ErrAwaitGeneration  = errors.New("generation is taken place, retry later")
+	contributorDataPool = mc.MutexMap{}
 )
 
 type WeekData struct {
@@ -81,28 +81,23 @@ func findLastSundayBeforeDate(dateStr string) (string, error) {
 func GetContributorStats(ctx context.Context, cache cache.Cache, repo *repo_model.Repository, revision string) (map[string]*ContributorData, error) {
 	// as GetContributorStats is resource intensive we cache the result
 	cacheKey := fmt.Sprintf(contributorStatsCacheKey, repo.FullName(), revision)
+
+	// If there's no data in the cache for this repository and revision, then
+	// check if you can lock the key in the contributor data pool. If not, then
+	// there's already a goroutine working on generating the data. If you can lock
+	// it then start the goroutine and give it the release function as 'finish'
+	// function. In all cases return to the client that generation started or is
+	// still being done and they should check in later to get the result.
 	if !cache.IsExist(cacheKey) {
-		genReady := make(chan struct{})
-
-		// dont start multiple async generations
-		_, run := generateLock.Load(cacheKey)
-		if run {
+		locked, release := contributorDataPool.TryLock(cacheKey)
+		if !locked {
+			release()
 			return nil, ErrAwaitGeneration
 		}
 
-		generateLock.Store(cacheKey, struct{}{})
-		// run generation async
-		go generateContributorStats(genReady, cache, cacheKey, repo, revision)
-
-		select {
-		case <-time.After(awaitGenerationTime):
-			return nil, ErrAwaitGeneration
-		case <-genReady:
-			// we got generation ready before timeout
-			break
-		}
+		go generateContributorStats(release, cache, cacheKey, repo, revision)
+		return nil, ErrAwaitGeneration
 	}
-	// TODO: renew timeout of cache cache.UpdateTimeout(cacheKey, contributorStatsCacheTimeout)
 
 	switch v := cache.Get(cacheKey).(type) {
 	case error:
@@ -204,19 +199,19 @@ func getExtendedCommitStats(repo *git.Repository, revision string /*, limit int 
 	return extendedCommitStats, nil
 }
 
-func generateContributorStats(genDone chan struct{}, cache cache.Cache, cacheKey string, repo *repo_model.Repository, revision string) {
-	ctx := graceful.GetManager().HammerContext()
+func generateContributorStats(done func(), cache cache.Cache, cacheKey string, repo *repo_model.Repository, revision string) {
+	desc := fmt.Sprintf("Generated contributor stats [%s]", cacheKey)
+	ctx, _, finished := process.GetManager().AddTypedContext(graceful.GetManager().HammerContext(), desc, process.NormalProcessType, true)
+	defer done()
+	defer finished()
 
-	gitRepo, closer, err := gitrepo.RepositoryFromContextOrOpen(ctx, repo)
+	gitRepo, err := gitrepo.OpenRepository(ctx, repo)
 	if err != nil {
 		log.Error("OpenRepository[repo=%q]: %v", repo.FullName(), err)
 		return
 	}
-	defer closer.Close()
+	defer gitRepo.Close()
 
-	if len(revision) == 0 {
-		revision = repo.DefaultBranch
-	}
 	extendedCommitStats, err := getExtendedCommitStats(gitRepo, revision)
 	if err != nil {
 		log.Error("getExtendedCommitStats[repo=%q revision=%q]: %v", repo.FullName(), revision, err)
@@ -313,9 +308,8 @@ func generateContributorStats(genDone chan struct{}, cache cache.Cache, cacheKey
 
 	// Store the data as an string, to make it uniform what data type is returned
 	// from caches.
-	_ = cache.Put(cacheKey, string(data), setting.CacheService.TTLSeconds())
-	generateLock.Delete(cacheKey)
-	if genDone != nil {
-		genDone <- struct{}{}
+	if err := cache.Put(cacheKey, string(data), setting.CacheService.TTLSeconds()); err != nil {
+		log.Error("cache.Put[repo=%q revision=%q]: %v", repo.FullName(), revision, err)
+		return
 	}
 }
