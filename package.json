@@ -118,7 +118,7 @@
     "stylelint-declaration-strict-value": "1.11.1",
     "stylelint-plugin-logical-css": "2.1.0",
     "stylelint-value-no-unknown-custom-properties": "6.1.1",
-    "svgo": "4.0.2",
+    "svgo": "4.1.0",
     "typescript": "5.9.3",
     "typescript-eslint": "8.60.1",
     "vite-string-plugin": "2.0.4",
