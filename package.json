@@ -120,7 +120,7 @@
     "typescript": "5.9.3",
     "typescript-eslint": "8.56.1",
     "vite-string-plugin": "2.0.0",
-    "vitest": "4.0.18"
+    "vitest": "4.1.11"
   },
   "browserslist": ["defaults"],
   "scarfSettings": {
